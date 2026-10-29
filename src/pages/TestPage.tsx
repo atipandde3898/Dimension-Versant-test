@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { getActiveAudioStream, requestAndStoreAudioStream, stopActiveAudioStream } from '../lib/audioStream';
 import type { Question } from '../types/database';
 import {
   Mic,
@@ -34,18 +35,24 @@ export const TestPage: React.FC = () => {
   const [readyCountdown, setReadyCountdown] = useState<number>(3);
   const [recordTimeLeft, setRecordTimeLeft] = useState<number>(20);
 
-  // Proctoring states
+  // Proctoring states & timing refs
   const [warningCount, setWarningCount] = useState<number>(candidate?.warning_count ?? 0);
   const [warningModalOpen, setWarningModalOpen] = useState<boolean>(false);
   const [autoSubmitting, setAutoSubmitting] = useState<boolean>(false);
+
+  const hasEnteredFullscreenRef = useRef<boolean>(false);
+  const fullscreenEnteredTimeRef = useRef<number>(0);
+  const questionStartTimeRef = useRef<number>(Date.now());
+  const isMicPromptingRef = useRef<boolean>(false);
   const lastWarningTimeRef = useRef<number>(0);
   const isHandlingWarningRef = useRef<boolean>(false);
+  const isAutoSubmittingRef = useRef<boolean>(false);
+  const handleUploadResponseRef = useRef<(q: Question, blob: Blob, secs: number) => Promise<void>>(async () => {});
 
   // Audio & media recording refs
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
   const recordingStartTimeRef = useRef<number>(0);
   const timerIntervalRef = useRef<any>(null);
   const readyIntervalRef = useRef<any>(null);
@@ -53,7 +60,7 @@ export const TestPage: React.FC = () => {
   // Keep track of audio prompts played in this session to prevent replay
   const playedAudioQuestionsRef = useRef<Set<string>>(new Set());
 
-  // 1. Load active questions from database
+  // 1. Load active questions from database ordered by order_number
   useEffect(() => {
     let isMounted = true;
 
@@ -77,27 +84,34 @@ export const TestPage: React.FC = () => {
 
         if (!isMounted) return;
 
+        // If question list is empty, show an error and do NOT submit the test
         if (!data || data.length === 0) {
-          setErrorMessage('No active questions found for the assessment. Please contact your test administrator.');
+          console.warn('[Test Progress] No active questions returned from Supabase.');
+          setErrorMessage('No active questions found in Supabase. Please ask an administrator to add active questions in the Questions manager.');
           setLoadingQuestions(false);
           return;
         }
 
-        setQuestions(data as Question[]);
+        const loadedQuestions = data as Question[];
+        setQuestions(loadedQuestions);
+        const total = loadedQuestions.length;
 
-        // Position candidate at current_question
-        const startPos = candidate?.current_question ?? 0;
-        if (startPos >= data.length) {
-          navigate('/done');
+        // Use zero-based index equal to candidates.current_question
+        const startPos = Number(candidate?.current_question ?? 0);
+        console.log(`[Test Progress] Loaded ${total} active questions from Supabase. Candidate start index: ${startPos}, Total: ${total}`);
+
+        if (startPos >= total && total > 0) {
+          console.log(`[Test Progress] Candidate already completed all questions (${startPos} >= ${total}). Redirecting to /done.`);
+          navigate('/done', { replace: true });
           return;
         }
 
         setCurrentIndex(startPos);
         setLoadingQuestions(false);
       } catch (err: any) {
-        console.error('Error fetching questions:', err);
+        console.error('Error fetching questions from Supabase:', err);
         if (isMounted) {
-          setErrorMessage(err.message || 'Failed to load test questions.');
+          setErrorMessage(err.message || 'Failed to load test questions from Supabase.');
           setLoadingQuestions(false);
         }
       }
@@ -118,9 +132,6 @@ export const TestPage: React.FC = () => {
       if (audioPlayerRef.current) {
         audioPlayerRef.current.pause();
         audioPlayerRef.current = null;
-      }
-      if (mediaStreamRef.current) {
-        mediaStreamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
   }, []);
@@ -164,15 +175,30 @@ export const TestPage: React.FC = () => {
   // --------------------------------------------------------------------------
   const handleSecurityEvent = useCallback(
     async (eventType: 'tab_switch' | 'fullscreen_exit') => {
-      // Avoid firing if test is still loading, already auto-submitting, or if warning fired < 4s ago
       const now = Date.now();
-      if (
-        loadingQuestions ||
-        autoSubmitting ||
-        isHandlingWarningRef.current ||
-        warningModalOpen ||
-        now - lastWarningTimeRef.current < 4000
-      ) {
+
+      // Avoid firing if test is still loading, already auto-submitting, handling warning, or warning modal open
+      if (loadingQuestions || autoSubmitting || isHandlingWarningRef.current || warningModalOpen) {
+        return;
+      }
+
+      // Ignore events during microphone permission prompt
+      if (isMicPromptingRef.current) {
+        return;
+      }
+
+      // Ignore events for 3 seconds after entering fullscreen
+      if (fullscreenEnteredTimeRef.current > 0 && now - fullscreenEnteredTimeRef.current < 3000) {
+        return;
+      }
+
+      // Ignore events for 3 seconds after a question starts
+      if (now - questionStartTimeRef.current < 3000) {
+        return;
+      }
+
+      // Debounce so one action counts once (at least 2 seconds apart)
+      if (now - lastWarningTimeRef.current < 2000) {
         return;
       }
 
@@ -193,11 +219,14 @@ export const TestPage: React.FC = () => {
         const updatedCount = typeof newWarningCount === 'number' ? newWarningCount : warningCount + 1;
         setWarningCount(updatedCount);
 
-        // Check if limit reached: 2 warnings -> immediate auto-submit
+        // Check if limit reached: only auto-submit when record_warning returns 2 or more
         if (updatedCount >= 2) {
+          console.log(`[finish_test called] Reason: security warnings exceeded (${updatedCount} warnings >= 2), status: auto_submitted`);
           setAutoSubmitting(true);
           setWarningModalOpen(false);
+          stopActiveAudioStream();
 
+          isAutoSubmittingRef.current = true;
           // Stop active recording and try to save whatever exists
           if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
             try {
@@ -233,10 +262,10 @@ export const TestPage: React.FC = () => {
           // Call finish_test('auto_submitted')
           await supabase.rpc('finish_test', { p_status: 'auto_submitted' });
           await refreshCandidate();
-          navigate('/done');
+          navigate('/done', { replace: true });
           return;
         } else {
-          // Warning 1 of 2: show full-screen modal
+          // Warning 1 of 2: show warning popup first
           setWarningModalOpen(true);
         }
       } catch (err) {
@@ -258,27 +287,42 @@ export const TestPage: React.FC = () => {
   );
 
   // Attach event listeners for proctoring & disable copy/paste/contextmenu
+  // Note: We do NOT count window blur. Count only (a) document.visibilityState becoming 'hidden'
+  // and (b) leaving fullscreen after the test had entered fullscreen.
   useEffect(() => {
     if (loadingQuestions || autoSubmitting) return;
 
-    // 1. Tab switch or minimize (visibilitychange & blur)
+    // Check initial fullscreen status
+    if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
+      if (!hasEnteredFullscreenRef.current) {
+        hasEnteredFullscreenRef.current = true;
+        fullscreenEnteredTimeRef.current = Date.now();
+      }
+    }
+
+    // 1. Tab switch or minimize: count ONLY document.visibilityState becoming 'hidden'
     const handleVisibilityChange = () => {
-      if (document.hidden || document.visibilityState === 'hidden') {
+      if (document.visibilityState === 'hidden') {
         handleSecurityEvent('tab_switch');
       }
     };
 
-    const handleWindowBlur = () => {
-      handleSecurityEvent('tab_switch');
-    };
-
-    // 2. Fullscreen exit detection
+    // 2. Fullscreen exit detection: count ONLY after the test had entered fullscreen
     const handleFullscreenChange = () => {
       const isFullscreen = Boolean(
         document.fullscreenElement || (document as any).webkitFullscreenElement
       );
-      if (!isFullscreen && !warningModalOpen && !autoSubmitting) {
-        handleSecurityEvent('fullscreen_exit');
+
+      if (isFullscreen) {
+        if (!hasEnteredFullscreenRef.current) {
+          hasEnteredFullscreenRef.current = true;
+          fullscreenEnteredTimeRef.current = Date.now();
+        }
+      } else {
+        // Only count leaving fullscreen if test HAD previously entered fullscreen
+        if (hasEnteredFullscreenRef.current && !warningModalOpen && !autoSubmitting) {
+          handleSecurityEvent('fullscreen_exit');
+        }
       }
     };
 
@@ -302,7 +346,6 @@ export const TestPage: React.FC = () => {
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('blur', handleWindowBlur);
     document.addEventListener('fullscreenchange', handleFullscreenChange);
     document.addEventListener('webkitfullscreenchange', handleFullscreenChange);
     document.addEventListener('contextmenu', preventAction);
@@ -314,7 +357,6 @@ export const TestPage: React.FC = () => {
 
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('blur', handleWindowBlur);
       document.removeEventListener('fullscreenchange', handleFullscreenChange);
       document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
       document.removeEventListener('contextmenu', preventAction);
@@ -334,6 +376,8 @@ export const TestPage: React.FC = () => {
       } else if ((document.documentElement as any).webkitRequestFullscreen) {
         await (document.documentElement as any).webkitRequestFullscreen();
       }
+      hasEnteredFullscreenRef.current = true;
+      fullscreenEnteredTimeRef.current = Date.now();
     } catch (e) {
       console.warn('Fullscreen re-entry failed:', e);
     }
@@ -350,10 +394,16 @@ export const TestPage: React.FC = () => {
     recordingStartTimeRef.current = Date.now();
 
     try {
-      let stream = mediaStreamRef.current;
+      // Reuse the existing active audio stream requested on the instructions page
+      let stream = getActiveAudioStream();
       if (!stream || !stream.active) {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaStreamRef.current = stream;
+        isMicPromptingRef.current = true;
+        try {
+          stream = await requestAndStoreAudioStream();
+        } finally {
+          isMicPromptingRef.current = false;
+          questionStartTimeRef.current = Date.now();
+        }
       }
 
       const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
@@ -377,9 +427,10 @@ export const TestPage: React.FC = () => {
       };
 
       recorder.onstop = async () => {
+        if (isAutoSubmittingRef.current) return;
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         const durationSeconds = Math.max(1, Math.round((Date.now() - recordingStartTimeRef.current) / 1000));
-        await handleUploadResponse(question, audioBlob, durationSeconds);
+        await handleUploadResponseRef.current(question, audioBlob, durationSeconds);
       };
 
       recorder.start(500);
@@ -401,9 +452,9 @@ export const TestPage: React.FC = () => {
       console.error('Microphone error during test:', err);
       setStep('error');
       setErrorMessage(
-        err.name === 'NotAllowedError'
-          ? 'Microphone permission was denied. Please allow microphone access in your browser settings to continue.'
-          : 'Could not access microphone. Please check your audio input device and click Retry.'
+        err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || err.message?.toLowerCase().includes('permission')
+          ? 'Microphone permission was denied by your browser. Please click the site permissions / padlock icon in your address bar, set Microphone to "Allow", and click Retry Question.'
+          : 'Could not access microphone. Please check your audio input device and click Retry Question.'
       );
     }
   }, []);
@@ -433,6 +484,16 @@ export const TestPage: React.FC = () => {
     setStep('uploading');
     setErrorMessage(null);
 
+    const i = questions.findIndex((q) => q.id === question.id);
+    const total = questions.length;
+
+    if (i === -1 || total === 0) {
+      console.error(`Invalid question index or empty question list: i=${i}, total=${total}`);
+      setStep('error');
+      setErrorMessage('Question not found or questions list is empty.');
+      return;
+    }
+
     const recordingPath = `${candidate.id}/${question.order_number}.webm`;
 
     try {
@@ -459,13 +520,23 @@ export const TestPage: React.FC = () => {
         throw new Error(`Failed to save response data: ${responseError.message}`);
       }
 
-      const nextIdx = currentIndex + 1;
-      await supabase.rpc('set_progress', { p_current: nextIdx });
+      // After saving a response for index i, call set_progress(i+1)
+      const nextIdx = i + 1;
+      const { error: progressError } = await supabase.rpc('set_progress', { p_current: nextIdx });
+      if (progressError) {
+        console.warn('set_progress RPC error:', progressError.message);
+      }
 
-      if (nextIdx >= questions.length) {
-        await supabase.rpc('finish_test', { p_status: 'submitted' });
+      // Call finish_test('submitted') ONLY when i+1 >= total
+      if (nextIdx >= total) {
+        console.log(`[finish_test called] Reason: all questions completed (index: ${i}, total: ${total}), status: submitted`);
+        const { error: finishError } = await supabase.rpc('finish_test', { p_status: 'submitted' });
+        if (finishError) {
+          console.warn('finish_test RPC error:', finishError.message);
+        }
+        stopActiveAudioStream();
         await refreshCandidate();
-        navigate('/done');
+        navigate('/done', { replace: true });
       } else {
         setCurrentIndex(nextIdx);
       }
@@ -475,11 +546,18 @@ export const TestPage: React.FC = () => {
       setErrorMessage(err.message || 'Failed to upload response. Please click Retry to submit again.');
     }
   };
+  handleUploadResponseRef.current = handleUploadResponse;
 
   useEffect(() => {
     if (loadingQuestions || !currentQuestion || autoSubmitting) return;
 
     let isCancelled = false;
+    questionStartTimeRef.current = Date.now();
+
+    // Log "index, total, status" to the console on every question change
+    const total = questions.length;
+    const currentStatus = candidate?.status || 'in_progress';
+    console.log(`[Test Progress] index, total, status: ${currentIndex}, ${total}, ${currentStatus}`);
 
     async function runQuestionLifecycle() {
       setErrorMessage(null);
@@ -531,7 +609,7 @@ export const TestPage: React.FC = () => {
         audioPlayerRef.current = null;
       }
     };
-  }, [currentIndex, currentQuestion, loadingQuestions, autoSubmitting, startCountdown]);
+  }, [currentIndex, currentQuestion, loadingQuestions, autoSubmitting, startCountdown, candidate?.status, questions.length]);
 
   const handleStopRecordingEarly = () => {
     if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
@@ -574,7 +652,34 @@ export const TestPage: React.FC = () => {
     );
   }
 
-  const progressPercent = Math.round((currentIndex / questions.length) * 100);
+  // If question list is empty or failed to load from Supabase: show error and do NOT submit the test
+  if (errorMessage && (!currentQuestion || questions.length === 0)) {
+    return (
+      <div className="flex-1 max-w-xl w-full mx-auto p-4 sm:p-8 flex flex-col justify-center">
+        <div className="bg-white rounded-2xl shadow-sm border border-red-200 p-8 text-center">
+          <AlertCircle className="w-10 h-10 text-red-500 mx-auto mb-3" />
+          <h2 className="text-lg font-bold text-slate-900">Unable to Load Assessment Questions</h2>
+          <p className="text-xs sm:text-sm text-slate-600 mt-2 leading-relaxed">{errorMessage}</p>
+          <div className="mt-6 flex flex-col sm:flex-row items-center justify-center gap-3">
+            <button
+              onClick={() => window.location.reload()}
+              className="w-full sm:w-auto px-4 py-2.5 bg-blue-700 hover:bg-blue-800 text-white rounded-lg text-xs font-semibold shadow-xs cursor-pointer"
+            >
+              Retry Loading Questions
+            </button>
+            <Link
+              to="/"
+              className="w-full sm:w-auto px-4 py-2.5 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg text-xs font-medium text-center"
+            >
+              Back to Start Page
+            </Link>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const progressPercent = questions.length > 0 ? Math.round((currentIndex / questions.length) * 100) : 0;
 
   return (
     <div className="flex-1 max-w-4xl w-full mx-auto p-4 sm:p-8 flex flex-col justify-center select-none">
@@ -688,21 +793,24 @@ export const TestPage: React.FC = () => {
 
         {/* Error State Banner */}
         {step === 'error' && errorMessage && (
-          <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl text-red-800 flex items-start justify-between gap-3 animate-in fade-in">
+          <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl text-red-900 space-y-3 animate-in fade-in">
             <div className="flex items-start gap-2.5">
               <AlertCircle className="w-5 h-5 text-red-600 mt-0.5 flex-shrink-0" />
               <div>
-                <p className="text-xs font-bold uppercase tracking-wider">Assessment Action Required</p>
+                <p className="text-xs font-bold uppercase tracking-wider text-red-800">Assessment Action Required</p>
                 <p className="text-xs sm:text-sm mt-0.5 leading-relaxed">{errorMessage}</p>
               </div>
             </div>
-            <button
-              onClick={handleRetryCurrentQuestion}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-semibold flex-shrink-0 shadow-xs cursor-pointer"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Retry Question</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2 pl-7">
+              <button
+                type="button"
+                onClick={handleRetryCurrentQuestion}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white rounded-lg text-xs font-semibold shadow-xs cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Retry Question</span>
+              </button>
+            </div>
           </div>
         )}
 

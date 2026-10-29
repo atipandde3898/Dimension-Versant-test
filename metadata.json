@@ -1,7 +1,7 @@
 {
   "name": "Dimension Education Verbal Test",
   "description": "Spoken English verbal communication assessment platform for Dimension Education with proctored testing, voice evaluation, and administrative management.",
-  "requestFramePermissions": [],
+  "requestFramePermissions": ["microphone"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
 

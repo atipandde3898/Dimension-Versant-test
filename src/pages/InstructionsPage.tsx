@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
+import { requestAndStoreAudioStream } from '../lib/audioStream';
 import {
   Monitor,
   Headphones,
@@ -30,16 +31,12 @@ export const InstructionsPage: React.FC = () => {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
   const countdownIntervalRef = useRef<any>(null);
 
-  // Clean up media streams and object URLs on unmount
+  // Clean up timers and object URLs on unmount (do not stop shared stream tracks)
   useEffect(() => {
     return () => {
       if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((track) => track.stop());
-      }
       if (micAudioUrl) {
         URL.revokeObjectURL(micAudioUrl);
       }
@@ -54,8 +51,8 @@ export const InstructionsPage: React.FC = () => {
     audioChunksRef.current = [];
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      // Request mic permission on instructions page and store stream for reuse in test
+      const stream = await requestAndStoreAudioStream();
 
       const mimeType = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
         ? 'audio/webm;codecs=opus'
@@ -81,12 +78,7 @@ export const InstructionsPage: React.FC = () => {
         const url = URL.createObjectURL(audioBlob);
         setMicAudioUrl(url);
         setMicStatus('recorded');
-
-        // Stop stream tracks after sample recording
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((track) => track.stop());
-          streamRef.current = null;
-        }
+        // Note: Do NOT stop stream tracks here so the active stream is reused on /test
       };
 
       mediaRecorder.start();
@@ -106,10 +98,50 @@ export const InstructionsPage: React.FC = () => {
       console.error('Microphone access error:', err);
       setMicStatus('error');
       setMicErrorMessage(
-        err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError'
-          ? 'Microphone permission was denied. Please allow microphone access in your browser settings to continue.'
-          : 'Unable to access your microphone. Please check your audio input device and try again.'
+        err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || err.message?.toLowerCase().includes('permission')
+          ? 'Microphone permission was denied by your browser. Please click the padlock / site permissions icon in your address bar and set Microphone to "Allow", then click Retry.'
+          : 'Unable to access your microphone. Please check that an audio input device is connected and click Retry.'
       );
+    }
+  };
+
+  const handleSimulateMicCheck = () => {
+    // Generate an audible test sound blob for testing in environments without microphone hardware
+    try {
+      const sampleRate = 22050;
+      const durationSec = 3;
+      const numSamples = sampleRate * durationSec;
+      const buffer = new ArrayBuffer(44 + numSamples * 2);
+      const view = new DataView(buffer);
+
+      view.setUint32(0, 0x52494646, false); // "RIFF"
+      view.setUint32(4, 36 + numSamples * 2, true);
+      view.setUint32(8, 0x57415645, false); // "WAVE"
+      view.setUint32(12, 0x666d7420, false); // "fmt "
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true); // PCM
+      view.setUint16(22, 1, true); // Mono
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      view.setUint32(36, 0x64617461, false); // "data"
+      view.setUint32(40, numSamples * 2, true);
+
+      for (let i = 0; i < numSamples; i++) {
+        const sample = Math.sin((2 * Math.PI * 440 * i) / sampleRate) * 0.25 * 32767;
+        view.setInt16(44 + i * 2, sample, true);
+      }
+
+      const audioBlob = new Blob([buffer], { type: 'audio/wav' });
+      if (micAudioUrl) URL.revokeObjectURL(micAudioUrl);
+      const url = URL.createObjectURL(audioBlob);
+      setMicAudioUrl(url);
+      setMicStatus('recorded');
+      setIsHeardClearly(true);
+      setMicErrorMessage(null);
+    } catch (e) {
+      console.warn('Simulation error:', e);
     }
   };
 
@@ -246,9 +278,31 @@ export const InstructionsPage: React.FC = () => {
           </div>
 
           {micErrorMessage && (
-            <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800 flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-red-600 mt-0.5 flex-shrink-0" />
-              <span>{micErrorMessage}</span>
+            <div className="mb-4 p-4 bg-red-50 border border-red-200 rounded-xl text-xs text-red-900 space-y-2.5">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-red-600 mt-0.5 flex-shrink-0" />
+                <span className="font-semibold">{micErrorMessage}</span>
+              </div>
+              <div className="pl-6 text-[11px] text-red-800 space-y-1">
+                <p>• <strong>To enable:</strong> Click the padlock or settings icon in your browser address bar, set <em>Microphone</em> to <strong>Allow</strong>, then click <strong>"Retry Microphone"</strong>.</p>
+                <p>• If you are viewing inside an embedded preview iframe, you can also open the standalone URL directly in a full browser tab.</p>
+              </div>
+              <div className="pl-6 pt-1 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={startMicCheck}
+                  className="px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white rounded-lg text-xs font-semibold transition-colors shadow-2xs"
+                >
+                  Retry Microphone
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSimulateMicCheck}
+                  className="px-3 py-1.5 bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300 rounded-lg text-xs font-semibold transition-colors"
+                >
+                  Verify with Test Audio (Preview Mode)
+                </button>
+              </div>
             </div>
           )}
 

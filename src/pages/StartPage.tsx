@@ -1,17 +1,33 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import type { Candidate } from '../types/database';
 import { Mic, ArrowRight, Shield, Clock, AlertCircle, KeyRound, User, Loader2, RefreshCw } from 'lucide-react';
 
 export const StartPage: React.FC = () => {
-  const { session, candidate, refreshAuth, refreshCandidate, signOut } = useAuth();
+  const { session, candidate, loading: authLoading, refreshAuth, refreshCandidate, signOut } = useAuth();
   const navigate = useNavigate();
 
   const [fullName, setFullName] = useState('');
   const [testCode, setTestCode] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // We only show the Resume screen if an in_progress candidate was detected on initial page load
+  const isStartedNewRef = useRef(false);
+  const [initialCandidate, setInitialCandidate] = useState<Candidate | null>(null);
+  const [initialized, setInitialized] = useState(false);
+
+  useEffect(() => {
+    // Lock in the existing candidate once auth finishes initial load
+    if (!authLoading && !initialized && !isStartedNewRef.current) {
+      if (candidate && candidate.status === 'in_progress') {
+        setInitialCandidate(candidate);
+      }
+      setInitialized(true);
+    }
+  }, [authLoading, candidate, initialized]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -35,27 +51,35 @@ export const StartPage: React.FC = () => {
       return;
     }
 
+    isStartedNewRef.current = true;
+    setInitialCandidate(null);
     setSubmitting(true);
 
     try {
+      console.log('Initiating test start flow for candidate:', trimmedName, 'with code:', formattedCode);
+
       // 1. Ensure an authenticated session exists (anonymous sign-in for candidates)
       let currentSession = session;
       if (!currentSession) {
+        console.log('No active session found, signing in anonymously...');
         const { data: anonData, error: anonError } = await supabase.auth.signInAnonymously();
         if (anonError) {
           throw new Error(`Session creation failed: ${anonError.message}`);
         }
         currentSession = anonData.session;
+        console.log('Anonymous sign-in successful. User ID:', currentSession?.user?.id);
       }
 
       // 2. Call start_test RPC: start_test(p_code, p_full_name) returns candidate uuid
+      console.log('Calling start_test RPC...');
       const { data: candidateId, error: rpcError } = await supabase.rpc('start_test', {
         p_code: formattedCode,
         p_full_name: trimmedName,
       });
 
       if (rpcError) {
-        // Detailed error formatting
+        isStartedNewRef.current = false;
+        console.error('start_test RPC failed with error:', rpcError);
         if (rpcError.message?.toLowerCase().includes('invalid or already used code')) {
           setErrorMessage('Invalid or already used test code. Please check your code or contact your test administrator.');
         } else if (rpcError.message?.toLowerCase().includes('name required')) {
@@ -70,37 +94,51 @@ export const StartPage: React.FC = () => {
       }
 
       if (!candidateId) {
+        isStartedNewRef.current = false;
+        console.error('start_test RPC returned empty candidateId');
         throw new Error('No candidate ID returned from test registration.');
       }
 
-      // 3. Refresh candidate data in context
-      await refreshAuth();
-      await refreshCandidate();
+      console.log('start_test succeeded with candidate ID:', candidateId);
 
-      // 4. On success, navigate to instructions
-      navigate('/instructions');
+      // (1) store the returned candidate id
+      console.log('Step 1: Storing returned candidate id:', candidateId);
+      localStorage.setItem('candidate_id', candidateId);
+
+      // (2) await refreshCandidate() so the auth context has the new candidate row
+      console.log('Step 2: Awaiting refreshCandidate()...');
+      const refreshedCandidate = await refreshCandidate();
+      console.log('Step 2 complete: Candidate row loaded in auth context:', refreshedCandidate);
+
+      // (3) only then navigate to /instructions
+      console.log('Step 3: Navigating to /instructions');
+      navigate('/instructions', { replace: true });
     } catch (err: any) {
-      console.error('Error starting test:', err);
+      console.error('Error in start flow:', err);
+      isStartedNewRef.current = false;
       setErrorMessage(err.message || 'An unexpected error occurred while starting the test.');
       setSubmitting(false);
     }
   };
 
+  // Resume must go to /instructions (not straight to /test), so the candidate clicks Start again
+  // and fullscreen is re-entered from a user click.
   const handleResume = () => {
-    if (!candidate) return;
-    if (candidate.current_question > 0) {
-      navigate('/test');
-    } else {
-      navigate('/instructions');
-    }
+    navigate('/instructions');
   };
 
   const handleStartNewSession = async () => {
     await signOut();
+    setInitialCandidate(null);
+    isStartedNewRef.current = false;
     setFullName('');
     setTestCode('');
     setErrorMessage(null);
   };
+
+  // Determine whether to display Resume card or Entry form
+  // ONLY show Resume when page first loaded with an existing in_progress candidate and we didn't just submit
+  const showResumeScreen = !isStartedNewRef.current && Boolean(initialCandidate && initialCandidate.status === 'in_progress');
 
   return (
     <div className="flex-1 flex flex-col items-center justify-center p-4 sm:p-8">
@@ -118,25 +156,25 @@ export const StartPage: React.FC = () => {
           </p>
         </div>
 
-        {/* Existing in_progress Candidate: Show Resume instead of form */}
-        {candidate && candidate.status === 'in_progress' ? (
+        {/* Existing in_progress Candidate on Initial Load: Show Resume */}
+        {showResumeScreen && initialCandidate ? (
           <div className="space-y-6">
             <div className="bg-blue-50/70 border border-blue-200 rounded-xl p-5 text-center">
               <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-blue-100 text-blue-800 uppercase tracking-wider">
                 Active Test Session Found
               </span>
-              <h2 className="text-lg font-bold text-slate-900 mt-2">{candidate.full_name}</h2>
+              <h2 className="text-lg font-bold text-slate-900 mt-2">{initialCandidate.full_name}</h2>
               <p className="text-xs text-slate-600 font-mono mt-1">
-                Test Code: <span className="font-semibold text-blue-700">{candidate.test_code}</span>
+                Test Code: <span className="font-semibold text-blue-700">{initialCandidate.test_code}</span>
               </p>
               <p className="text-xs text-slate-500 mt-1">
-                Progress: Question {candidate.current_question + 1}
+                Progress: Question {initialCandidate.current_question + 1}
               </p>
 
               <button
                 type="button"
                 onClick={handleResume}
-                className="mt-5 w-full inline-flex items-center justify-center gap-2 py-3 px-5 bg-blue-700 hover:bg-blue-800 text-white font-semibold rounded-lg text-sm transition-colors shadow-xs"
+                className="mt-5 w-full inline-flex items-center justify-center gap-2 py-3 px-5 bg-blue-700 hover:bg-blue-800 text-white font-semibold rounded-lg text-sm transition-colors shadow-xs cursor-pointer"
               >
                 <span>Resume Test</span>
                 <ArrowRight className="w-4 h-4" />
@@ -147,10 +185,10 @@ export const StartPage: React.FC = () => {
               <button
                 type="button"
                 onClick={handleStartNewSession}
-                className="text-xs text-slate-500 hover:text-slate-800 underline inline-flex items-center gap-1"
+                className="text-xs text-slate-500 hover:text-slate-800 underline inline-flex items-center gap-1 cursor-pointer"
               >
                 <RefreshCw className="w-3 h-3" />
-                <span>Not {candidate.full_name}? Use a different test code</span>
+                <span>Not {initialCandidate.full_name}? Use a different test code</span>
               </button>
             </div>
           </div>
@@ -218,12 +256,12 @@ export const StartPage: React.FC = () => {
             <button
               type="submit"
               disabled={submitting}
-              className="w-full inline-flex items-center justify-center gap-2 py-3 px-5 bg-blue-700 hover:bg-blue-800 disabled:bg-blue-400 text-white font-semibold rounded-lg text-sm transition-colors shadow-xs mt-2"
+              className="w-full inline-flex items-center justify-center gap-2 py-3 px-5 bg-blue-700 hover:bg-blue-800 disabled:bg-blue-400 text-white font-semibold rounded-lg text-sm transition-colors shadow-xs mt-2 cursor-pointer"
             >
               {submitting ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Verifying Code & Starting Session...</span>
+                  <span>Starting...</span>
                 </>
               ) : (
                 <>

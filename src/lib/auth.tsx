@@ -50,10 +50,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, []);
 
-  // Lookup candidate for current user
+  // Lookup candidate for current user or stored candidate_id
   const lookupCandidate = useCallback(async (currentUserId?: string): Promise<Candidate | null> => {
-    if (!isSupabaseConfigured || !currentUserId) return null;
+    if (!isSupabaseConfigured) return null;
     try {
+      const storedCandidateId = localStorage.getItem('candidate_id');
+      if (storedCandidateId) {
+        const { data: storedCand, error: storedError } = await supabase
+          .from('candidates')
+          .select('*')
+          .eq('id', storedCandidateId)
+          .maybeSingle();
+        if (!storedError && storedCand) {
+          return storedCand as Candidate;
+        }
+      }
+
+      if (!currentUserId) return null;
       const { data, error } = await supabase
         .from('candidates')
         .select('*')
@@ -74,11 +87,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, []);
 
   const refreshCandidate = useCallback(async (): Promise<Candidate | null> => {
-    if (!user) {
-      setCandidate(null);
-      return null;
+    let currentUser = user;
+    if (!currentUser) {
+      const { data: { session: currentSession } } = await supabase.auth.getSession();
+      currentUser = currentSession?.user ?? null;
+      if (currentUser) setUser(currentUser);
+      if (currentSession) setSession(currentSession);
     }
-    const cand = await lookupCandidate(user.id);
+    const cand = await lookupCandidate(currentUser?.id);
     setCandidate(cand);
     return cand;
   }, [user, lookupCandidate]);
@@ -149,6 +165,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (isSupabaseConfigured) {
       await supabase.auth.signOut();
     }
+    localStorage.removeItem('candidate_id');
     setSession(null);
     setUser(null);
     setIsAdmin(false);
