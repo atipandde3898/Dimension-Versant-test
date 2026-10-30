@@ -40,6 +40,7 @@ export const TestPage: React.FC = () => {
   const [warningModalOpen, setWarningModalOpen] = useState<boolean>(false);
   const [autoSubmitting, setAutoSubmitting] = useState<boolean>(false);
 
+  const warningCountRef = useRef<number>(candidate?.warning_count ?? 0);
   const hasEnteredFullscreenRef = useRef<boolean>(false);
   const fullscreenEnteredTimeRef = useRef<number>(0);
   const questionStartTimeRef = useRef<number>(Date.now());
@@ -48,6 +49,20 @@ export const TestPage: React.FC = () => {
   const isHandlingWarningRef = useRef<boolean>(false);
   const isAutoSubmittingRef = useRef<boolean>(false);
   const handleUploadResponseRef = useRef<(q: Question, blob: Blob, secs: number) => Promise<void>>(async () => {});
+
+  // Sync warningCountRef whenever candidate warning_count updates
+  useEffect(() => {
+    if (candidate?.warning_count !== undefined) {
+      warningCountRef.current = candidate.warning_count;
+    }
+  }, [candidate?.warning_count]);
+
+  // Redirect to /done whenever candidate.status is 'submitted' or 'auto_submitted'
+  useEffect(() => {
+    if (candidate?.status === 'submitted' || candidate?.status === 'auto_submitted') {
+      navigate('/done', { replace: true });
+    }
+  }, [candidate?.status, navigate]);
 
   // Audio & media recording refs
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
@@ -177,8 +192,8 @@ export const TestPage: React.FC = () => {
     async (eventType: 'tab_switch' | 'fullscreen_exit') => {
       const now = Date.now();
 
-      // Avoid firing if test is still loading, already auto-submitting, handling warning, or warning modal open
-      if (loadingQuestions || autoSubmitting || isHandlingWarningRef.current || warningModalOpen) {
+      // Avoid firing if test is still loading, already auto-submitting, or handling warning
+      if (loadingQuestions || isAutoSubmittingRef.current || isHandlingWarningRef.current) {
         return;
       }
 
@@ -212,22 +227,31 @@ export const TestPage: React.FC = () => {
           p_question_id: currentQuestion?.id || null,
         });
 
-        if (error) {
+        const isNoActiveTest = Boolean(
+          error?.message && error.message.toLowerCase().includes('no active test')
+        );
+
+        if (error && !isNoActiveTest) {
           console.warn('record_warning RPC error:', error.message);
         }
 
-        const updatedCount = typeof newWarningCount === 'number' ? newWarningCount : warningCount + 1;
-        setWarningCount(updatedCount);
+        const count = typeof newWarningCount === 'number'
+          ? newWarningCount
+          : warningCountRef.current + 1;
 
-        // Check if limit reached: only auto-submit when record_warning returns 2 or more
-        if (updatedCount >= 2) {
-          console.log(`[finish_test called] Reason: security warnings exceeded (${updatedCount} warnings >= 2), status: auto_submitted`);
+        warningCountRef.current = count;
+        setWarningCount(count);
+
+        // 6. Log "[warning] type, count" to console
+        console.log('[warning] type, count', eventType, count);
+
+        // 1. If it returns a count of 2 or more, OR returns an error containing "No active test", treat test as ended
+        if (count >= 2 || isNoActiveTest) {
+          isAutoSubmittingRef.current = true;
           setAutoSubmitting(true);
           setWarningModalOpen(false);
-          stopActiveAudioStream();
 
-          isAutoSubmittingRef.current = true;
-          // Stop active recording and try to save whatever exists
+          // Stop recorder (recorder.onstop does nothing when isAutoSubmittingRef.current is true)
           if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
             try {
               mediaRecorderRef.current.stop();
@@ -236,32 +260,18 @@ export const TestPage: React.FC = () => {
             }
           }
 
-          // If there is audio collected, attempt best-effort upload
-          if (audioChunksRef.current.length > 0 && candidate && currentQuestion) {
-            try {
-              const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
-              const recordingPath = `${candidate.id}/${currentQuestion.order_number}.webm`;
-              await supabase.storage.from('recordings').upload(recordingPath, audioBlob, {
-                contentType: 'audio/webm',
-                upsert: true,
-              });
-              await supabase.from('responses').upsert(
-                {
-                  candidate_id: candidate.id,
-                  question_id: currentQuestion.id,
-                  audio_path: recordingPath,
-                  duration_seconds: Math.max(1, Math.round((Date.now() - recordingStartTimeRef.current) / 1000)),
-                },
-                { onConflict: 'candidate_id,question_id' }
-              );
-            } catch (e) {
-              console.warn('Best-effort upload on auto-submit failed:', e);
-            }
+          // Stop microphone stream
+          stopActiveAudioStream();
+
+          // 2. Harmless extra step: finish_test('auto_submitted') (ignore errors)
+          try {
+            await supabase.rpc('finish_test', { p_status: 'auto_submitted' });
+          } catch {
+            // ignore error
           }
 
-          // Call finish_test('auto_submitted')
-          await supabase.rpc('finish_test', { p_status: 'auto_submitted' });
           await refreshCandidate();
+          console.log('[auto-submit] done');
           navigate('/done', { replace: true });
           return;
         } else {
@@ -274,23 +284,14 @@ export const TestPage: React.FC = () => {
         isHandlingWarningRef.current = false;
       }
     },
-    [
-      loadingQuestions,
-      autoSubmitting,
-      warningModalOpen,
-      currentQuestion,
-      candidate,
-      warningCount,
-      refreshCandidate,
-      navigate,
-    ]
+    [loadingQuestions, currentQuestion, refreshCandidate, navigate]
   );
 
   // Attach event listeners for proctoring & disable copy/paste/contextmenu
   // Note: We do NOT count window blur. Count only (a) document.visibilityState becoming 'hidden'
   // and (b) leaving fullscreen after the test had entered fullscreen.
   useEffect(() => {
-    if (loadingQuestions || autoSubmitting) return;
+    if (loadingQuestions) return;
 
     // Check initial fullscreen status
     if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
@@ -319,8 +320,8 @@ export const TestPage: React.FC = () => {
           fullscreenEnteredTimeRef.current = Date.now();
         }
       } else {
-        // Only count leaving fullscreen if test HAD previously entered fullscreen
-        if (hasEnteredFullscreenRef.current && !warningModalOpen && !autoSubmitting) {
+        // In the fullscreenchange handler keep only the hasEnteredFullscreenRef check
+        if (hasEnteredFullscreenRef.current) {
           handleSecurityEvent('fullscreen_exit');
         }
       }
@@ -366,7 +367,7 @@ export const TestPage: React.FC = () => {
       document.removeEventListener('selectstart', preventAction);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [loadingQuestions, autoSubmitting, warningModalOpen, handleSecurityEvent]);
+  }, [loadingQuestions, handleSecurityEvent]);
 
   // Return to test and re-enter fullscreen from warning modal
   const handleAcknowledgeWarning = async () => {
