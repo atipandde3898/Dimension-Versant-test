@@ -39,16 +39,40 @@ export const TestPage: React.FC = () => {
   const [warningCount, setWarningCount] = useState<number>(candidate?.warning_count ?? 0);
   const [warningModalOpen, setWarningModalOpen] = useState<boolean>(false);
   const [autoSubmitting, setAutoSubmitting] = useState<boolean>(false);
+  const [securityLimitExceeded, setSecurityLimitExceeded] = useState<boolean>(false);
+
+  // Fullscreen gate state & debug events
+  const [inFullscreen, setInFullscreen] = useState<boolean>(
+    typeof document !== 'undefined'
+      ? Boolean(document.fullscreenElement || (document as any).webkitFullscreenElement)
+      : false
+  );
+  const [securityEvents, setSecurityEvents] = useState<
+    Array<{
+      id: string;
+      time: string;
+      type: string;
+      result: 'counted' | 'ignored';
+      reason: string;
+      warningCountAfter?: number;
+    }>
+  >([]);
 
   const warningCountRef = useRef<number>(candidate?.warning_count ?? 0);
   const hasEnteredFullscreenRef = useRef<boolean>(false);
   const fullscreenEnteredTimeRef = useRef<number>(0);
+  const fullscreenExitHandledRef = useRef<boolean>(false);
   const questionStartTimeRef = useRef<number>(Date.now());
   const isMicPromptingRef = useRef<boolean>(false);
   const lastWarningTimeRef = useRef<number>(0);
   const isHandlingWarningRef = useRef<boolean>(false);
   const isAutoSubmittingRef = useRef<boolean>(false);
+  const isGatePausedRef = useRef<boolean>(false);
+  const hasLoadedQuestionsRef = useRef<boolean>(false);
+  const initialStartIndexRef = useRef<number>(0);
+
   const handleUploadResponseRef = useRef<(q: Question, blob: Blob, secs: number) => Promise<void>>(async () => {});
+  const handleSecurityEventRef = useRef<(eventType: 'tab_switch' | 'fullscreen_exit') => Promise<void>>(async () => {});
 
   // Sync warningCountRef whenever candidate warning_count updates
   useEffect(() => {
@@ -75,8 +99,11 @@ export const TestPage: React.FC = () => {
   // Keep track of audio prompts played in this session to prevent replay
   const playedAudioQuestionsRef = useRef<Set<string>>(new Set());
 
-  // 1. Load active questions from database ordered by order_number
+  // 1. Load active questions from database ordered by order_number - RUN ONCE per candidate.id
   useEffect(() => {
+    if (!candidate?.id) return;
+    if (hasLoadedQuestionsRef.current) return;
+
     let isMounted = true;
 
     async function fetchQuestions() {
@@ -111,8 +138,11 @@ export const TestPage: React.FC = () => {
         setQuestions(loadedQuestions);
         const total = loadedQuestions.length;
 
-        // Use zero-based index equal to candidates.current_question
+        // Store starting index in a ref on first load, run once per candidate.id
         const startPos = Number(candidate?.current_question ?? 0);
+        initialStartIndexRef.current = startPos;
+        hasLoadedQuestionsRef.current = true;
+
         console.log(`[Test Progress] Loaded ${total} active questions from Supabase. Candidate start index: ${startPos}, Total: ${total}`);
 
         if (startPos >= total && total > 0) {
@@ -137,7 +167,7 @@ export const TestPage: React.FC = () => {
     return () => {
       isMounted = false;
     };
-  }, [candidate, navigate]);
+  }, [candidate?.id, navigate]);
 
   // Clean up timers and audio on unmount
   useEffect(() => {
@@ -191,29 +221,51 @@ export const TestPage: React.FC = () => {
   const handleSecurityEvent = useCallback(
     async (eventType: 'tab_switch' | 'fullscreen_exit') => {
       const now = Date.now();
+      const timeStr = new Date().toLocaleTimeString();
+
+      const logEvent = (result: 'counted' | 'ignored', reason: string, countAfter?: number) => {
+        setSecurityEvents((prev) => [
+          ...prev.slice(-4),
+          {
+            id: `${now}-${Math.random()}`,
+            time: timeStr,
+            type: eventType,
+            result,
+            reason,
+            warningCountAfter: countAfter,
+          },
+        ]);
+      };
 
       // Avoid firing if test is still loading, already auto-submitting, or handling warning
-      if (loadingQuestions || isAutoSubmittingRef.current || isHandlingWarningRef.current) {
+      if (loadingQuestions) {
+        logEvent('ignored', 'loading_questions');
+        return;
+      }
+      if (isAutoSubmittingRef.current) {
+        logEvent('ignored', 'already_auto_submitting');
+        return;
+      }
+      if (isHandlingWarningRef.current) {
+        logEvent('ignored', 'already_handling_warning');
         return;
       }
 
-      // Ignore events during microphone permission prompt
+      // 1. Microphone permission prompt ignore
       if (isMicPromptingRef.current) {
+        logEvent('ignored', 'mic_permission_prompt');
         return;
       }
 
-      // Ignore events for 3 seconds after entering fullscreen
+      // 2. Ignore events for 3 seconds right after entering fullscreen via the button
       if (fullscreenEnteredTimeRef.current > 0 && now - fullscreenEnteredTimeRef.current < 3000) {
+        logEvent('ignored', 'within_3s_of_fullscreen_entry');
         return;
       }
 
-      // Ignore events for 3 seconds after a question starts
-      if (now - questionStartTimeRef.current < 3000) {
-        return;
-      }
-
-      // Debounce so one action counts once (at least 2 seconds apart)
+      // 3. Debounce so one action counts once (at least 2 seconds apart)
       if (now - lastWarningTimeRef.current < 2000) {
+        logEvent('ignored', 'debounced_2s');
         return;
       }
 
@@ -242,14 +294,31 @@ export const TestPage: React.FC = () => {
         warningCountRef.current = count;
         setWarningCount(count);
 
-        // 6. Log "[warning] type, count" to console
+        logEvent('counted', 'violation_recorded', count);
         console.log('[warning] type, count', eventType, count);
 
-        // 1. If it returns a count of 2 or more, OR returns an error containing "No active test", treat test as ended
+        // 4. Second violation display: When record_warning returns 2 or more (or "No active test"),
+        // show "Security Limit Exceeded" screen for 3 seconds, then call finish_test('auto_submitted'),
+        // await refreshCandidate(), and navigate('/done', { replace: true }). Do not upload partial recording.
         if (count >= 2 || isNoActiveTest) {
           isAutoSubmittingRef.current = true;
           setAutoSubmitting(true);
+          setSecurityLimitExceeded(true);
           setWarningModalOpen(false);
+
+          // Clear running timers
+          if (timerIntervalRef.current) {
+            clearInterval(timerIntervalRef.current);
+            timerIntervalRef.current = null;
+          }
+          if (readyIntervalRef.current) {
+            clearInterval(readyIntervalRef.current);
+            readyIntervalRef.current = null;
+          }
+          if (audioPlayerRef.current) {
+            audioPlayerRef.current.pause();
+            audioPlayerRef.current = null;
+          }
 
           // Stop recorder (recorder.onstop does nothing when isAutoSubmittingRef.current is true)
           if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
@@ -263,7 +332,10 @@ export const TestPage: React.FC = () => {
           // Stop microphone stream
           stopActiveAudioStream();
 
-          // 2. Harmless extra step: finish_test('auto_submitted') (ignore errors)
+          // Show the "Security Limit Exceeded" screen for 3 seconds
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+
+          // Harmless extra step: finish_test('auto_submitted') (ignore errors)
           try {
             await supabase.rpc('finish_test', { p_status: 'auto_submitted' });
           } catch {
@@ -286,46 +358,67 @@ export const TestPage: React.FC = () => {
     },
     [loadingQuestions, currentQuestion, refreshCandidate, navigate]
   );
+  handleSecurityEventRef.current = handleSecurityEvent;
 
   // Attach event listeners for proctoring & disable copy/paste/contextmenu
-  // Note: We do NOT count window blur. Count only (a) document.visibilityState becoming 'hidden'
-  // and (b) leaving fullscreen after the test had entered fullscreen.
+  // Note: Count only (a) document.visibilityState becoming 'hidden' and (b) leaving fullscreen after entered
   useEffect(() => {
     if (loadingQuestions) return;
 
     // Check initial fullscreen status
-    if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
-      if (!hasEnteredFullscreenRef.current) {
-        hasEnteredFullscreenRef.current = true;
-        fullscreenEnteredTimeRef.current = Date.now();
-      }
+    const isFs = Boolean(
+      document.fullscreenElement || (document as any).webkitFullscreenElement
+    );
+    setInFullscreen(isFs);
+    if (isFs && !hasEnteredFullscreenRef.current) {
+      hasEnteredFullscreenRef.current = true;
+      fullscreenEnteredTimeRef.current = Date.now();
     }
 
     // 1. Tab switch or minimize: count ONLY document.visibilityState becoming 'hidden'
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
-        handleSecurityEvent('tab_switch');
+        handleSecurityEventRef.current('tab_switch');
       }
     };
 
-    // 2. Fullscreen exit detection: count ONLY after the test had entered fullscreen
+    // 2. Fullscreen exit detection with fallback
     const handleFullscreenChange = () => {
-      const isFullscreen = Boolean(
+      const currentIsFs = Boolean(
         document.fullscreenElement || (document as any).webkitFullscreenElement
       );
+      setInFullscreen(currentIsFs);
 
-      if (isFullscreen) {
+      if (currentIsFs) {
+        fullscreenExitHandledRef.current = false;
         if (!hasEnteredFullscreenRef.current) {
           hasEnteredFullscreenRef.current = true;
           fullscreenEnteredTimeRef.current = Date.now();
         }
       } else {
-        // In the fullscreenchange handler keep only the hasEnteredFullscreenRef check
-        if (hasEnteredFullscreenRef.current) {
-          handleSecurityEvent('fullscreen_exit');
+        if (hasEnteredFullscreenRef.current && !fullscreenExitHandledRef.current) {
+          fullscreenExitHandledRef.current = true;
+          handleSecurityEventRef.current('fullscreen_exit');
         }
       }
     };
+
+    // Fallback polling interval every 500 ms
+    const fsInterval = setInterval(() => {
+      const currentIsFs = Boolean(
+        document.fullscreenElement || (document as any).webkitFullscreenElement
+      );
+      setInFullscreen(currentIsFs);
+
+      if (currentIsFs) {
+        fullscreenExitHandledRef.current = false;
+      } else {
+        if (hasEnteredFullscreenRef.current && !fullscreenExitHandledRef.current) {
+          fullscreenExitHandledRef.current = true;
+          handleSecurityEventRef.current('fullscreen_exit');
+        }
+      }
+    }, 500);
 
     // 3. Disable right-click context menu, text selection, and copy/paste
     const preventAction = (e: Event) => {
@@ -357,6 +450,7 @@ export const TestPage: React.FC = () => {
     window.addEventListener('keydown', handleKeyDown);
 
     return () => {
+      clearInterval(fsInterval);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       document.removeEventListener('fullscreenchange', handleFullscreenChange);
       document.removeEventListener('webkitfullscreenchange', handleFullscreenChange);
@@ -367,7 +461,24 @@ export const TestPage: React.FC = () => {
       document.removeEventListener('selectstart', preventAction);
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [loadingQuestions, handleSecurityEvent]);
+  }, [loadingQuestions]);
+
+  // Enter fullscreen helper for gate
+  const handleEnterFullscreen = async () => {
+    try {
+      if (document.documentElement.requestFullscreen) {
+        await document.documentElement.requestFullscreen();
+      } else if ((document.documentElement as any).webkitRequestFullscreen) {
+        await (document.documentElement as any).webkitRequestFullscreen();
+      }
+      hasEnteredFullscreenRef.current = true;
+      fullscreenEnteredTimeRef.current = Date.now();
+      fullscreenExitHandledRef.current = false;
+      setInFullscreen(true);
+    } catch (e) {
+      console.warn('Fullscreen entry failed:', e);
+    }
+  };
 
   // Return to test and re-enter fullscreen from warning modal
   const handleAcknowledgeWarning = async () => {
@@ -379,6 +490,8 @@ export const TestPage: React.FC = () => {
       }
       hasEnteredFullscreenRef.current = true;
       fullscreenEnteredTimeRef.current = Date.now();
+      fullscreenExitHandledRef.current = false;
+      setInFullscreen(true);
     } catch (e) {
       console.warn('Fullscreen re-entry failed:', e);
     }
@@ -428,7 +541,7 @@ export const TestPage: React.FC = () => {
       };
 
       recorder.onstop = async () => {
-        if (isAutoSubmittingRef.current) return;
+        if (isAutoSubmittingRef.current || isGatePausedRef.current) return;
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         const durationSeconds = Math.max(1, Math.round((Date.now() - recordingStartTimeRef.current) / 1000));
         await handleUploadResponseRef.current(question, audioBlob, durationSeconds);
@@ -550,9 +663,32 @@ export const TestPage: React.FC = () => {
   handleUploadResponseRef.current = handleUploadResponse;
 
   useEffect(() => {
-    if (loadingQuestions || !currentQuestion || autoSubmitting) return;
+    if (loadingQuestions || !currentQuestion || autoSubmitting || securityLimitExceeded) return;
+
+    // Fullscreen gate: while not in fullscreen or warning modal is open, pause question flow
+    if (!inFullscreen || warningModalOpen) {
+      if (readyIntervalRef.current) {
+        clearInterval(readyIntervalRef.current);
+        readyIntervalRef.current = null;
+      }
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+        timerIntervalRef.current = null;
+      }
+      if (audioPlayerRef.current) {
+        audioPlayerRef.current.pause();
+      }
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        isGatePausedRef.current = true;
+        try {
+          mediaRecorderRef.current.stop();
+        } catch {}
+      }
+      return;
+    }
 
     let isCancelled = false;
+    isGatePausedRef.current = false;
     questionStartTimeRef.current = Date.now();
 
     // Log "index, total, status" to the console on every question change
@@ -563,6 +699,7 @@ export const TestPage: React.FC = () => {
     async function runQuestionLifecycle() {
       setErrorMessage(null);
 
+      // Resume from start without replaying audio that already played
       if (currentQuestion.audio_path && !playedAudioQuestionsRef.current.has(currentQuestion.id)) {
         setStep('listening');
         playedAudioQuestionsRef.current.add(currentQuestion.id);
@@ -609,8 +746,26 @@ export const TestPage: React.FC = () => {
         audioPlayerRef.current.pause();
         audioPlayerRef.current = null;
       }
+      if (readyIntervalRef.current) {
+        clearInterval(readyIntervalRef.current);
+        readyIntervalRef.current = null;
+      }
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+        timerIntervalRef.current = null;
+      }
     };
-  }, [currentIndex, currentQuestion, loadingQuestions, autoSubmitting, startCountdown, candidate?.status, questions.length]);
+  }, [
+    currentIndex,
+    currentQuestion,
+    loadingQuestions,
+    autoSubmitting,
+    securityLimitExceeded,
+    inFullscreen,
+    warningModalOpen,
+    startCountdown,
+    questions.length,
+  ]);
 
   const handleStopRecordingEarly = () => {
     if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
@@ -635,7 +790,7 @@ export const TestPage: React.FC = () => {
     );
   }
 
-  if (autoSubmitting) {
+  if (autoSubmitting || securityLimitExceeded) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center min-h-[50vh] p-6">
         <div className="bg-white rounded-2xl shadow-lg border border-red-200 p-8 max-w-md w-full text-center">
@@ -681,9 +836,37 @@ export const TestPage: React.FC = () => {
   }
 
   const progressPercent = questions.length > 0 ? Math.round((currentIndex / questions.length) * 100) : 0;
+  const showFullscreenGate = !loadingQuestions && !inFullscreen && !warningModalOpen && !isAutoSubmittingRef.current && !securityLimitExceeded;
+  const isDebugMode = typeof window !== 'undefined' && window.location.href.includes('debug=1');
 
   return (
     <div className="flex-1 max-w-4xl w-full mx-auto p-4 sm:p-8 flex flex-col justify-center select-none">
+      {/* Fullscreen Gate: Blocking Overlay */}
+      {showFullscreenGate && (
+        <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-md w-full p-6 sm:p-8 text-center animate-in zoom-in-95 duration-150">
+            <div className="w-14 h-14 rounded-2xl bg-blue-50 text-blue-700 flex items-center justify-center mx-auto mb-4 border border-blue-200">
+              <Maximize2 className="w-8 h-8" />
+            </div>
+
+            <h2 className="text-xl font-bold text-slate-900">Fullscreen Required</h2>
+
+            <p className="text-slate-700 mt-2 text-sm leading-relaxed font-medium">
+              Fullscreen is required. Click to continue
+            </p>
+
+            <button
+              type="button"
+              onClick={handleEnterFullscreen}
+              className="mt-6 w-full inline-flex items-center justify-center gap-2 py-3 px-5 bg-blue-700 hover:bg-blue-800 text-white font-semibold rounded-lg text-sm transition-colors shadow-xs cursor-pointer"
+            >
+              <Maximize2 className="w-4 h-4" />
+              <span>Click to continue</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Full-Screen Security Warning Modal (Warning 1 of 2) */}
       {warningModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4">
@@ -908,6 +1091,54 @@ export const TestPage: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Debug Panel: Visible ONLY when window.location.href contains "debug=1" */}
+      {isDebugMode && (
+        <div className="fixed bottom-4 right-4 z-50 bg-slate-950/95 text-slate-100 text-xs p-4 rounded-xl shadow-2xl border border-slate-700 max-w-sm w-full font-mono space-y-2 pointer-events-auto">
+          <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+            <span className="font-bold text-emerald-400">Proctoring Debug Panel</span>
+            <span className="text-[10px] bg-slate-800 px-1.5 py-0.5 rounded text-slate-300">debug=1</span>
+          </div>
+          <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[11px]">
+            <div>inFullscreen: <span className={inFullscreen ? 'text-emerald-400 font-bold' : 'text-red-400 font-bold'}>{String(inFullscreen)}</span></div>
+            <div>hasEnteredFs: <span className="text-slate-300 font-bold">{String(hasEnteredFullscreenRef.current)}</span></div>
+            <div>warningCountRef: <span className="text-amber-400 font-bold">{warningCountRef.current}</span></div>
+            <div>step: <span className="text-blue-400 font-bold">{step}</span></div>
+            <div className="col-span-2">isAutoSubmittingRef: <span className="text-slate-300 font-bold">{String(isAutoSubmittingRef.current)}</span></div>
+          </div>
+          <div className="pt-2 border-t border-slate-800">
+            <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-1">
+              Last 5 Security Events:
+            </div>
+            {securityEvents.length === 0 ? (
+              <div className="text-[11px] text-slate-500 italic">No events logged yet</div>
+            ) : (
+              <div className="space-y-1 max-h-40 overflow-y-auto">
+                {securityEvents.map((evt) => (
+                  <div key={evt.id} className="text-[10px] bg-slate-900 p-1.5 rounded border border-slate-800">
+                    <div className="flex items-center justify-between">
+                      <span className="text-slate-400">[{evt.time}] {evt.type}</span>
+                      <span
+                        className={
+                          evt.result === 'counted'
+                            ? 'text-red-400 font-bold'
+                            : 'text-amber-400 font-bold'
+                        }
+                      >
+                        {evt.result.toUpperCase()}
+                      </span>
+                    </div>
+                    <div className="text-slate-400 text-[9px] mt-0.5">
+                      Reason: <span className="text-slate-200">{evt.reason}</span>
+                      {evt.warningCountAfter !== undefined && ` (count: ${evt.warningCountAfter})`}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };
